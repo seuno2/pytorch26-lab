@@ -1,0 +1,801 @@
+# ============================================================
+# 3일차 7교시 — TAC 구현
+# 복사해서 그대로 실행하면 됩니다. 고칠 것 없습니다.
+# ------------------------------------------------------------
+# 이 교시 코드는 앞 교시의 변수·클래스를 이어 씁니다.
+# 그래서 이 블록에는 **여기까지 필요한 코드가 전부** 들어 있습니다.
+# (수업용 코드만 따로 복사하면 NameError 가 납니다 — 그건 정상입니다.)
+# ============================================================
+
+# ── 2일차 1교시에서 이어받음 ──
+import random                            # 여러 개 중에서 아무거나 뽑을 때 쓰는 도구
+from collections import deque             # 앞뒤로 넣고 빼기 쉬운 '줄서기 상자'
+import numpy as np                        # 숫자 계산 도구 (파이썬의 계산기)
+import torch                              # 파이토치 — 신경망을 다루는 도구
+
+
+class ReplayBuffer:
+    """
+    경험 재현 버퍼 — 게임하면서 겪은 일을 적어 두는 '일기장'입니다.
+
+    왜 필요할까요?
+      방금 겪은 일만 보고 배우면 비슷한 것만 연달아 보게 됩니다.
+      (왼쪽으로 갔다 -> 또 왼쪽 -> 또 왼쪽 ...)
+      그러면 신경망이 방금 본 것에만 맞추고 예전 것을 잊어버립니다.
+      그래서 일기장에 잔뜩 적어 두고, 배울 때는 여기저기서 섞어서 꺼냅니다.
+
+    이 상자는 3일 내내 씁니다 — 오늘 DQN, 내일 DDPG와 SAC.
+    """
+
+    def __init__(self, capacity=100_000, action_dtype=torch.int64):
+        # capacity = 일기장에 몇 줄까지 적어 둘지 (10만 줄)
+        #            넘치면 가장 오래된 것부터 자동으로 지워집니다.
+        #
+        # action_dtype = 행동을 어떤 숫자로 적을지
+        #   오늘 DQN  : 행동이 "0번? 1번?" 이라서 정수(int64)
+        #   내일 DDPG : 행동이 "힘을 1.37만큼" 이라서 실수(float32)
+        #   -> 내일은 ReplayBuffer(100_000, action_dtype=torch.float32) 로 씁니다.
+        #      정수로 두면 1.37 이 1 로 잘려서 학습이 통째로 망가집니다.
+        self.buffer = deque(maxlen=capacity)    # 실제 일기장 (꽉 차면 앞쪽부터 밀려남)
+        self.action_dtype = action_dtype        # 행동을 적을 숫자 종류를 기억해 둔다
+
+    def push(self, s, a, r, s_next, done):
+        # 일기 한 줄 적기:
+        #   "이 상황(s)에서 이 행동(a)을 했더니 점수(r)를 받고
+        #    저 상황(s_next)이 됐다. 그리고 판이 끝났나?(done)"
+        self.buffer.append((s, a, r, s_next, done))   # 다섯 개를 한 묶음으로 저장
+
+    def sample(self, batch_size):
+        # 일기장에서 batch_size 줄을 무작위로 뽑아 온다 (= 섞어서 꺼내기)
+        batch = random.sample(self.buffer, batch_size)   # 예: 아무 데서나 64줄
+
+        # 뽑아온 것은 (상황, 행동, 점수, 다음상황, 끝났나) 묶음들의 목록입니다.
+        # zip(*batch) 는 이걸 세로로 갈라 줍니다 —
+        #   상황은 상황끼리, 행동은 행동끼리 따로 모아 줍니다.
+        s, a, r, s_next, done = zip(*batch)
+
+        # 파이썬 목록 -> 넘파이 배열 -> 파이토치 텐서 순서로 바꿉니다.
+        # 왜 np.array 를 한 번 거칠까요?
+        #   배열들의 '목록'을 텐서로 바로 만들면 파이토치가 하나씩 복사하느라
+        #   아주 느려집니다. 넘파이로 먼저 한 덩어리를 만들면 훨씬 빠릅니다.
+        return (
+            torch.as_tensor(np.array(s), dtype=torch.float32),       # 상황들
+            torch.as_tensor(np.array(a), dtype=self.action_dtype),   # 행동들
+            torch.as_tensor(np.array(r), dtype=torch.float32),       # 점수들
+            torch.as_tensor(np.array(s_next), dtype=torch.float32),  # 다음 상황들
+            torch.as_tensor(np.array(done), dtype=torch.float32),    # 끝났나 (1이면 끝)
+        )
+
+    def __len__(self):
+        # len(buffer) 라고 쓰면 이 함수가 불립니다 — 지금 몇 줄 적혀 있는지 알려 줍니다
+        return len(self.buffer)
+
+# ============================================================
+# 잘 만들어졌는지 확인 (이 부분이 있어야 실행했을 때 결과가 보입니다)
+# ============================================================
+print('일기장이 잘 만들어졌는지 확인합니다.')
+print()
+
+buf = ReplayBuffer(capacity=1000)              # 1000줄짜리 일기장 하나 만들기
+
+for i in range(200):                            # 가짜 경험 200줄 적어 보기
+    s = np.random.randn(4).astype(np.float32)   # 상황 (숫자 4개)
+    a = np.random.randint(2)                    # 행동 (0 또는 1)
+    r = 1.0                                     # 점수
+    s2 = np.random.randn(4).astype(np.float32)  # 다음 상황
+    buf.push(s, a, r, s2, 0.0)                  # 일기장에 한 줄 적기
+
+print(f'  일기장에 적힌 줄 수 : {len(buf)}')
+print()
+
+s, a, r, s2, done = buf.sample(32)              # 32줄 무작위로 꺼내기
+print('  32줄 꺼냈을 때 모양')
+print(f'    상황 s      {tuple(s.shape)}   {s.dtype}')
+print(f'    행동 a      {tuple(a.shape)}      {a.dtype}   <- 정수여야 gather 가 됩니다')
+print(f'    점수 r      {tuple(r.shape)}      {r.dtype}')
+print(f'    다음상황 s2 {tuple(s2.shape)}   {s2.dtype}')
+print(f'    끝났나 done {tuple(done.shape)}      {done.dtype}')
+print()
+print('  -> 모양이 위와 같이 나오면 정상입니다. 4교시에서 이 상자를 그대로 씁니다.')
+
+# ── 1교시에서 이어받음 — DDPG 소개 ──
+import torch                                   # 파이토치
+import torch.nn as nn                           # 신경망 부품 상자
+
+
+# ============================================================
+# 오늘부터 행동이 달라집니다.
+#   어제까지 : "왼쪽? 오른쪽?" — 고르는 문제 (이산)
+#   오늘부터 : "힘을 1.37만큼" — 값을 정하는 문제 (연속)
+#
+# 왜 어제 방식이 안 통할까요?
+#   어제는 모든 행동의 Q값을 내놓고 그중 max 를 골랐습니다.
+#   그런데 힘의 크기는 -2.000 부터 2.000 까지 무한히 많습니다.
+#   전부 계산해서 max 를 고르는 게 불가능합니다.
+#   -> 그래서 "행동을 직접 내놓는 신경망"을 따로 둡니다. 그게 Actor 입니다.
+# ============================================================
+
+
+class Actor(nn.Module):
+    """
+    상황을 받아서 '할 행동'을 바로 내놓는 신경망.
+
+    어제 정책망과 다른 점:
+      어제는 확률을 내놓고 뽑았습니다 (0번 70%, 1번 30%)
+      오늘은 값 하나를 딱 정합니다 (힘 1.37) — 이걸 '결정적'이라고 합니다.
+    """
+
+    def __init__(self, state_dim, action_dim, max_action):
+        # state_dim  = 상황을 나타내는 숫자 개수 (Pendulum 은 3개)
+        # action_dim = 행동 값이 몇 개인지 (Pendulum 은 1개 — 회전시킬 힘)
+        # max_action = 행동의 최대 크기 (Pendulum 은 2.0)
+        super().__init__()                      # 부모 준비 — 빠뜨리면 오류
+
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 256), nn.ReLU(),      # 3개 -> 256개, 구부리기
+            nn.Linear(256, 256), nn.ReLU(),            # 256 -> 256, 또 구부리기
+            nn.Linear(256, action_dim), nn.Tanh(),     # 256 -> 1개, 그리고 Tanh
+        )
+        # 왜 마지막에 Tanh 를 붙일까요?
+        #   Tanh 는 어떤 숫자가 들어와도 -1 ~ +1 사이로 눌러 줍니다.
+        #   그래야 행동이 엉뚱하게 큰 값(예: 500)이 되는 것을 막습니다.
+        #   어제 Q값에는 활성화를 안 붙였는데, 그건 값의 범위가 정해져
+        #   있지 않았기 때문입니다. 행동은 범위가 정해져 있습니다.
+
+        self.max_action = max_action            # 나중에 곱해 줄 배율을 기억해 둔다
+
+    def forward(self, s):
+        # Tanh 로 -1~1 이 된 값에 max_action 을 곱해 실제 범위로 늘린다
+        #   예: 0.685 x 2.0 = 1.37
+        return self.net(s) * self.max_action
+
+
+class Critic(nn.Module):
+    """
+    (상황, 행동) 을 함께 받아서 "이 조합이 얼마나 좋은지" 점수를 매기는 신경망.
+
+    ★ 어제 DQN 과 가장 크게 다른 점 ★
+      어제 : 상황만 받고 -> 모든 행동의 Q값을 한꺼번에 내놓음
+      오늘 : 상황 + 행동을 같이 받고 -> 그 하나에 대한 Q값만 내놓음
+      행동이 무한히 많으니 "다 내놓기"가 불가능하기 때문입니다.
+    """
+
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 256), nn.ReLU(),
+            #          ^^^^^^^^^^^^^^^^^^^^^ 상황과 행동을 붙여서 넣으므로 크기를 더한다
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, 1),                  # 결과는 점수 하나
+        )
+
+    def forward(self, s, a):
+        # torch.cat = 두 텐서를 옆으로 이어 붙이기
+        #   상황 3개 + 행동 1개 = 4개짜리 한 줄이 됩니다.
+        # dim=-1 = "맨 마지막 축 방향으로" 붙인다는 뜻
+        # squeeze(-1) = (배치, 1) -> (배치,) 로 눌러 모양 맞추기
+        return self.net(torch.cat([s, a], dim=-1)).squeeze(-1)
+
+
+def soft_update(target, source, tau=0.005):
+    """
+    과녁(타깃 네트워크)을 조금씩만 따라오게 하는 함수. DDPG 와 SAC 가 함께 씁니다.
+
+    어제와 무엇이 다른가요?
+      어제 : 20판마다 과녁을 통째로 갈아 끼웠습니다 (계단처럼 툭 바뀜)
+      오늘 : 매번 0.5% 씩만 섞습니다 (미끄러지듯 천천히 따라옴)
+
+    왜 바꾸나요?
+      연속 행동은 값이 아주 예민합니다. 과녁이 계단처럼 툭툭 튀면
+      학습이 그때마다 흔들리다 무너집니다. 그래서 천천히 섞습니다.
+    """
+    # zip = 두 신경망의 숫자 뭉치를 짝지어 하나씩 꺼낸다
+    for tp, sp in zip(target.parameters(), source.parameters()):
+        # 새 과녁 = 0.5% 는 최신 것 + 99.5% 는 원래 과녁
+        tp.data.copy_(tau * sp.data + (1 - tau) * tp.data)
+        # .data 를 쓰는 이유: 이건 '학습'이 아니라 '복사'입니다.
+        #   미분 기록을 남기지 않고 값만 바꿔치기합니다.
+
+# ============================================================
+# 잘 만들어졌는지 확인 (이 부분이 있어야 실행했을 때 결과가 보입니다)
+# ============================================================
+import copy
+torch.manual_seed(0)
+
+print('배우와 평론가가 잘 만들어졌는지 확인합니다.')
+print()
+
+actor = Actor(state_dim=3, action_dim=1, max_action=2.0)   # Pendulum 규격
+critic = Critic(state_dim=3, action_dim=1)
+
+s = torch.randn(6, 3)                            # 상황 6개
+a = actor(s)                                     # 배우가 행동을 내놓는다
+q = critic(s, a)                                 # 평론가가 점수를 매긴다
+
+print(f'  입력 상황        {tuple(s.shape)}')
+print(f'  배우가 낸 행동   {tuple(a.shape)}   범위 [{a.min().item():+.3f}, {a.max().item():+.3f}]')
+print('                    <- Tanh x 2.0 이라 -2 ~ +2 안에 있어야 합니다')
+print(f'  평론가가 낸 값   {tuple(q.shape)}')
+print()
+
+# soft_update 가 실제로 조금씩만 옮기는지 확인
+target = copy.deepcopy(actor)
+with torch.no_grad():
+    for p in actor.parameters():
+        p.add_(1.0)                              # 본체를 확 바꿔 본다
+
+before = target.net[0].weight[0, 0].item()
+soft_update(target, actor, tau=0.005)
+after = target.net[0].weight[0, 0].item()
+
+print('  soft_update 확인')
+print(f'    과녁 값  {before:.5f} -> {after:.5f}   (움직인 폭 {after - before:+.5f})')
+print('    본체는 1.0 만큼 바뀌었는데 과녁은 0.005 만 따라왔습니다.')
+print()
+print('  -> 여기까지 나오면 정상입니다. 2교시에서 이 셋으로 학습을 돌립니다.')
+
+# ── 2교시에서 이어받음 — DDPG 구현 ──
+import gymnasium as gym                        # 게임(환경) 만드는 도구
+import torch                                   # 파이토치
+import torch.nn as nn                          # 신경망 부품 상자
+import numpy as np                             # 숫자 계산 도구
+import copy                                    # 통째로 복사할 때 쓰는 도구
+
+# Pendulum = 막대를 흔들어서 거꾸로 세우는 게임
+#   점수가 항상 음수입니다. 0에 가까울수록 잘한 것입니다.
+#   아무렇게나 하면 -1200 근처가 나옵니다.
+env = gym.make("Pendulum-v1")
+
+state_dim = env.observation_space.shape[0]     # 상황을 나타내는 숫자 = 3개
+                                               # (막대 각도의 cos, sin, 회전 속도)
+action_dim = env.action_space.shape[0]         # 행동 값 = 1개 (돌리는 힘)
+max_action = float(env.action_space.high[0])   # 힘의 최대 크기 = 2.0
+
+# ── 신경망 4개를 만듭니다 ──
+#   actor    : 무엇을 할지 정하는 쪽 (배우)
+#   critic   : 그게 얼마나 좋은지 점수 매기는 쪽 (평론가)
+#   actor_t  : 배우의 과녁 (천천히 따라오는 복사본)
+#   critic_t : 평론가의 과녁
+actor = Actor(state_dim, action_dim, max_action)
+critic = Critic(state_dim, action_dim)
+
+actor_t, critic_t = copy.deepcopy(actor), copy.deepcopy(critic)
+# deepcopy = 완전히 똑같은 별개의 복사본을 만든다
+#   그냥 actor_t = actor 라고 하면 같은 것을 가리켜서 과녁 역할을 못 합니다.
+
+actor_opt = torch.optim.Adam(actor.parameters(), lr=1e-4)    # 배우용 옵티마이저
+critic_opt = torch.optim.Adam(critic.parameters(), lr=1e-3)  # 평론가용 옵티마이저
+# 배우의 학습률이 10배 작습니다.
+#   평론가가 아직 엉터리인데 배우가 빨리 따라가면 엉뚱한 걸 배웁니다.
+#   "평론가가 먼저 실력을 갖추고, 배우는 천천히" 라는 뜻입니다.
+
+buffer = ReplayBuffer(100_000, action_dtype=torch.float32)
+# ★ action_dtype=torch.float32 를 꼭 넣어야 합니다 ★
+#   행동이 1.37 같은 실수인데 정수로 두면 1 로 잘려 학습이 통째로 망가집니다.
+
+gamma, batch_size, noise_std = 0.99, 128, 0.1
+# gamma      = 미래를 얼마나 챙길지
+# batch_size = 한 번에 128개씩 꺼내 배운다
+# noise_std  = 행동에 섞을 흔들림의 크기 (아래에서 설명)
+
+
+def train_step():
+    """일기장에서 꺼내 한 번 배우는 함수. 평론가 먼저, 배우 나중."""
+
+    s, a, r, s_next, done = buffer.sample(batch_size)   # 128개 꺼내기
+
+    # ── ① 평론가 배우기 ──
+    with torch.no_grad():                      # 정답 만들기 — 미분 금지 구역
+        # 다음 상황에서 '과녁 배우'가 할 행동을 구하고,
+        # 그 행동의 점수를 '과녁 평론가'에게 물어본다.
+        target_q = critic_t(s_next, actor_t(s_next))
+
+        # 정답 = 지금 받은 점수 + 감마 x 다음 상황의 값
+        # (1 - done) : 판이 끝났으면 뒤는 없다
+        y = r + gamma * target_q * (1 - done)
+
+    # 평론가의 예상이 정답에 가까워지게 한다
+    critic_loss = nn.functional.mse_loss(critic(s, a), y)
+    critic_opt.zero_grad()                     # 지난 기울기 지우기
+    critic_loss.backward()                     # 어디를 고칠지 계산
+    critic_opt.step()                          # 한 걸음 이동
+
+    # ── ② 배우 배우기 ──
+    # 배우의 목표는 "평론가에게 좋은 점수를 받는 행동을 내놓는 것" 입니다.
+    #   critic(s, actor(s)) = 배우가 낸 행동을 평론가가 채점한 점수
+    #   그 점수를 '키우고' 싶으니 마이너스를 붙여 '줄이는' 문제로 바꿉니다.
+    actor_loss = -critic(s, actor(s)).mean()
+    actor_opt.zero_grad()
+    actor_loss.backward()
+    actor_opt.step()
+    # 여기서 평론가도 같이 바뀌지 않나요?
+    #   critic_opt 는 평론가 것만 고치고 actor_opt 는 배우 것만 고칩니다.
+    #   옵티마이저가 나뉘어 있어서 서로 건드리지 않습니다.
+
+    # ── ③ 과녁을 아주 조금 따라오게 한다 ──
+    soft_update(actor_t, actor)                # 0.5% 씩만 섞는다
+    soft_update(critic_t, critic)
+
+
+returns = []                                   # 판마다 점수 기록 (= 학습곡선)
+
+for episode in range(200):                     # 200판을 한다
+    s, _ = env.reset()                         # 새 판 시작
+    total, done = 0.0, False
+
+    while not done:
+        # ── 행동 고르기 ──
+        with torch.no_grad():                  # 행동만 고를 땐 미분 준비 불필요
+            a = actor(torch.as_tensor(s, dtype=torch.float32)).numpy()
+
+        # 배우는 같은 상황에서 항상 같은 답을 냅니다 (결정적).
+        # 그대로 두면 새로운 것을 전혀 안 해봅니다 = 탐험이 없습니다.
+        # 그래서 답에 살짝 흔들림을 더합니다. "32도" 대신 "32.4도" 처럼.
+        #   어제 eps-greedy 가 "가끔 아예 딴 행동"이었다면,
+        #   오늘은 "늘 조금씩 다르게" 입니다. 연속 행동이라 이 방식이 맞습니다.
+        a += np.random.normal(0, noise_std * max_action, action_dim)
+
+        # 흔들림을 더하다 범위를 벗어날 수 있으니 잘라 준다
+        a = a.clip(-max_action, max_action)
+
+        s_next, r, term, trunc, _ = env.step(a)    # 실제로 해본다
+        done = term or trunc
+
+        buffer.push(s, a, r, s_next, float(term))  # 일기장에 적는다
+        s, total = s_next, total + r               # 다음 상황으로, 점수 누적
+
+        if len(buffer) >= 1000:                # 1000줄 이상 쌓인 뒤부터 배운다
+            train_step()
+
+    returns.append(total)                      # 이번 판 점수 기록
+
+    if episode % 10 == 0:                      # 10판마다 출력
+        print(f"ep {episode:3d}  최근 10ep 평균 리턴 {np.mean(returns[-10:]):7.1f}")
+
+# -1500 근처에서 시작해 -200 근처까지 올라오면 성공입니다.
+# 학습에 6분쯤 걸립니다 — 돌려 놓고 설명을 들으시면 됩니다.
+
+# ── 3교시에서 이어받음 — Maximum Entropy RL 소개 ──
+import torch                                   # 파이토치
+import torch.nn.functional as F                 # softmax 같은 함수 모음
+
+# ============================================================
+# 최대 엔트로피 강화학습이 뭘 하려는 건지, 숫자 하나로 봅니다.
+#
+# 지금까지는 "가장 좋은 행동 하나"를 찾았습니다.
+# 그런데 비슷비슷하게 좋은 길이 여럿이면 어떨까요?
+#   -> 하나만 붙잡고 있으면, 그 길이 막혔을 때 대안이 없습니다.
+#   -> "좋은 길들을 골고루 알아 두자" 가 최대 엔트로피의 생각입니다.
+#
+# 조절 손잡이가 alpha 입니다. '온도'라고 부릅니다.
+# ============================================================
+
+q_values = torch.tensor([1.0, 0.9, 0.2, -1.0])
+# 행동 4개의 점수입니다.
+#   0번(1.0) 과 1번(0.9) 은 거의 비슷하게 좋습니다.
+#   2번(0.2) 은 그저 그렇고, 3번(-1.0) 은 나쁩니다.
+
+for alpha in [0.01, 0.5, 5.0]:                 # 온도를 세 가지로 바꿔 본다
+
+    # 최대 엔트로피에서의 최적 정책은 이 모양입니다:  softmax(Q / alpha)
+    #   softmax = 점수들을 전부 양수로 만들고 합이 1이 되게 나누는 것 (= 확률로 만들기)
+    #   Q 를 alpha 로 나누는 게 핵심입니다.
+    #     alpha 가 작으면 -> Q/alpha 차이가 커짐 -> 1등에 확 몰림
+    #     alpha 가 크면   -> Q/alpha 차이가 작아짐 -> 골고루 퍼짐
+    pi = F.softmax(q_values / alpha, dim=0)
+
+    # 엔트로피 = 얼마나 골고루인가.  H = -Σ p·log p
+    #   한 곳에 몰려 있으면 0에 가깝고, 골고루면 큽니다.
+    #
+    # + 1e-12 를 왜 더할까요?
+    #   alpha 가 아주 작으면 확률이 정확히 0이 되는 칸이 생깁니다.
+    #   log(0) 은 마이너스 무한대라 0 x (-무한대) = nan 이 되어 버립니다.
+    #   아주 작은 수를 더해 그 사고를 막습니다. 값에는 영향이 없습니다.
+    entropy = -(pi * torch.log(pi + 1e-12)).sum()
+
+    print(f"alpha={alpha:4.2f}  pi={pi.numpy().round(3)}  H={entropy:.3f}")
+
+# 결과를 읽는 법
+#   alpha=0.01 -> 거의 1등에 몰빵. 지금까지 하던 방식(greedy)과 거의 같습니다.
+#   alpha=0.5  -> 비슷하게 좋은 0번과 1번을 골고루 씁니다. ← 이게 우리가 원하는 것
+#   alpha=5.0  -> 나쁜 3번까지 거의 똑같이 씁니다. 너무 퍼졌습니다.
+#
+# 그래서 alpha 를 잘 잡는 게 중요한데, 문제마다 좋은 값이 다릅니다.
+# -> 4교시 SAC 는 이 alpha 를 사람이 정하지 않고 '스스로 조절'하게 만듭니다.
+
+# ── 4교시에서 이어받음 — SAC 소개 ──
+import torch                                   # 파이토치
+import torch.nn as nn                           # 신경망 부품 상자
+
+LOG_STD_MIN, LOG_STD_MAX = -20, 2
+# 흔들림의 크기(표준편차)가 너무 작거나 너무 커지지 않게 막는 울타리입니다.
+# 로그로 다루는 이유: 표준편차는 항상 양수여야 하는데,
+#   신경망은 음수도 내놓습니다. 그래서 "로그값"을 내놓게 하고
+#   나중에 exp() 를 씌우면 반드시 양수가 됩니다. 안전한 트릭입니다.
+
+
+class GaussianActor(nn.Module):
+    """
+    SAC 의 배우. 어제 DDPG 배우와 결정적으로 다릅니다.
+
+      DDPG 배우 : "힘 1.37" 이라고 딱 하나를 정한다 (결정적)
+      SAC  배우 : "평균 1.37, 흔들림 0.2 정도로 뽑아라" 라고 분포를 정한다 (확률적)
+
+    왜 분포를 내놓나요?
+      탐험을 밖에서 억지로 넣지 않고 정책 자체가 갖게 하려는 것입니다.
+      DDPG 는 행동에 잡음을 따로 더했는데, SAC 는 필요 없습니다.
+    """
+
+    def __init__(self, state_dim, action_dim, max_action):
+        super().__init__()                      # 부모 준비 — 빠뜨리면 오류
+
+        # 몸통 — 상황을 이해하는 부분
+        self.body = nn.Sequential(
+            nn.Linear(state_dim, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+        )
+
+        self.mu_head = nn.Linear(256, action_dim)       # 평균 (어느 쪽으로 갈지)
+        self.log_std_head = nn.Linear(256, action_dim)  # 흔들림 크기의 로그
+        self.max_action = max_action                    # 행동 범위 배율 (Pendulum 은 2.0)
+
+    def forward(self, s):
+        h = self.body(s)                        # 상황 이해
+
+        mu = self.mu_head(h)                    # 평균
+
+        log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        # clamp = 울타리 안으로 자르기. 너무 작으면 -20, 너무 크면 2로.
+        #   이걸 안 하면 흔들림이 0이 되거나 폭발해서 학습이 깨집니다.
+
+        dist = torch.distributions.Normal(mu, log_std.exp())
+        # 정규분포를 만든다. exp() 로 로그를 되돌리면 반드시 양수가 됩니다.
+
+        u = dist.rsample()
+        # ★ sample() 이 아니라 rsample() 입니다 ★
+        #   sample()  : 그냥 뽑기. 미분이 끊깁니다.
+        #   rsample() : "평균 + 흔들림 x 무작위" 형태로 뽑기. 미분이 통과합니다.
+        #   미분이 통과해야 "평균을 어느 쪽으로 옮길지"를 배울 수 있습니다.
+        #   이걸 재매개변수화(reparameterization) 트릭이라고 부릅니다.
+
+        a = torch.tanh(u)                       # -1 ~ +1 사이로 누른다 (행동 범위 맞추기)
+
+        # ── 여기가 이 코드에서 가장 어려운 두 줄입니다 ──
+        log_prob = dist.log_prob(u).sum(-1)
+        # 뽑은 값 u 의 확률(의 로그). sum(-1) 은 행동이 여러 개일 때 다 더하는 것.
+
+        log_prob -= torch.log(1 - a.pow(2) + 1e-6).sum(-1)
+        # tanh 로 눌렀으니 확률도 그만큼 보정해야 합니다.
+        #
+        # 왜 보정이 필요한가요? (쉬운 비유)
+        #   고무줄에 눈금을 그려 놓고 잡아당기면 눈금 간격이 달라집니다.
+        #   tanh 는 값을 눌러 붙이는 일이라, 눌린 곳은 확률이 촘촘해집니다.
+        #   그 변화만큼 빼 주는 것이 이 줄입니다.
+        #   (수학에서는 '변수 변환에 따른 야코비안 보정' 이라고 부릅니다)
+        #
+        # + 1e-6 은 a 가 정확히 ±1 일 때 log(0) 이 되는 사고를 막는 안전장치입니다.
+        #
+        # ※ 이 줄을 빼먹으면 오류는 안 나는데 학습이 이상해집니다.
+        #   SAC 구현에서 가장 흔한 실수입니다.
+
+        return a * self.max_action, log_prob
+        # 행동(범위 맞춘 것)과 그 행동의 로그확률을 함께 돌려준다
+        # 로그확률이 필요한 이유: 엔트로피 항을 계산해야 하기 때문입니다.
+
+# ============================================================
+# 잘 만들어졌는지 확인 (이 부분이 있어야 실행했을 때 결과가 보입니다)
+# ============================================================
+torch.manual_seed(0)
+
+print('확률적 배우가 잘 만들어졌는지 확인합니다.')
+print()
+
+actor = GaussianActor(state_dim=3, action_dim=1, max_action=2.0)
+
+s = torch.randn(5, 3)                            # 상황 5개
+a, logp = actor(s)
+
+print(f'  입력 상황       {tuple(s.shape)}')
+print(f'  뽑힌 행동       {tuple(a.shape)}   범위 [{a.min().item():+.3f}, {a.max().item():+.3f}]')
+print('                   <- tanh x 2.0 이라 -2 ~ +2 안에 있어야 합니다')
+print(f'  로그확률        {tuple(logp.shape)}')
+print()
+
+print('  같은 상황을 두 번 넣어 보면')
+a1, _ = actor(s[:1])
+a2, _ = actor(s[:1])
+print(f'    첫 번째 {a1.item():+.4f}   두 번째 {a2.item():+.4f}')
+print('    -> 값이 다릅니다. 확률적 정책이라 매번 다르게 뽑습니다.')
+print('       (어제 DDPG 배우는 항상 같은 값을 냈습니다)')
+print()
+print('  미분이 통과하는지 (rsample 확인)')
+print(f'    행동.requires_grad = {a.requires_grad}   <- True 여야 배우가 학습됩니다')
+print()
+print('  -> 여기까지 나오면 정상입니다. 6교시에서 이 배우로 SAC 를 돌립니다.')
+
+# ── 5교시에서 이어받음 — TAC 소개 ──
+import torch                                   # 파이토치
+
+# ============================================================
+# TAC = SAC 의 '엔트로피 계산법'만 바꾼 것입니다.
+#
+# SAC 는 로그(log)를 씁니다. 로그는 확률이 0에 가까워지면 -무한대로 갑니다.
+#   -> 그래서 나쁜 행동도 확률을 완전히 0으로는 못 만듭니다. 조금은 남습니다.
+#
+# TAC 는 q-로그라는 다른 자를 씁니다. q 를 키우면
+#   -> 나쁜 행동의 확률을 진짜 0으로 만들 수 있습니다.
+#   -> "쓸데없는 데는 아예 안 가겠다" 는 뜻입니다.
+# ============================================================
+
+
+def q_log(x, q):
+    """
+    Tsallis q-로그. q 가 1이면 우리가 아는 자연로그와 같아집니다.
+
+    수식:  (x^(q-1) - 1) / (q - 1)
+    q=1 을 그대로 넣으면 0으로 나누게 되므로 따로 처리합니다.
+    """
+    if abs(q - 1.0) < 1e-6:                    # q 가 사실상 1이면
+        return torch.log(x)                    # 그냥 자연로그
+    return (x.pow(q - 1) - 1) / (q - 1)        # 아니면 q-로그 공식
+
+
+q_values = torch.tensor([1.0, 0.9, 0.2, -1.0])
+# 3교시와 같은 행동 4개입니다.
+#   0번과 1번은 비슷하게 좋고, 3번은 확실히 나쁩니다.
+
+alpha = 0.5                                    # 엔트로피를 얼마나 챙길지 (온도)
+
+for q in [1.0, 1.5, 2.0]:                      # q 를 세 가지로 바꿔 본다
+
+    # 최적 정책을 공식으로 바로 못 구하니 경사하강법으로 찾아봅니다.
+    # (파이토치로 최적화 문제를 푸는 연습이기도 합니다)
+
+    logits = torch.zeros(4, requires_grad=True)   # 행동 4개의 점수. 0에서 시작.
+    opt = torch.optim.Adam([logits], lr=0.05)     # 이 숫자 4개를 직접 학습시킨다
+                                                  # (신경망이 아니라 값 자체를 고친다)
+
+    for _ in range(2000):                      # 2000번 반복해서 최적점을 찾는다
+        pi = torch.softmax(logits, dim=0)      # 점수 -> 확률로
+
+        entropy_q = -(pi * q_log(pi, q)).sum() # q-엔트로피 계산
+                                               # q=1 이면 우리가 아는 엔트로피와 같습니다
+
+        # 목표: 기대 점수도 높이고 + 엔트로피도 높이고
+        #   마이너스를 붙여 '줄이는 문제'로 바꿉니다 (옵티마이저는 줄이기만 하므로)
+        loss = -((pi * q_values).sum() + alpha * entropy_q)
+
+        opt.zero_grad()                        # 지난 기울기 지우기
+        loss.backward()                        # 기울기 계산
+        opt.step()                             # 한 걸음 이동
+
+    print(f"q={q:.1f}  pi={pi.detach().numpy().round(3)}")
+    # .detach() = 미분 연결을 끊고 값만 꺼내기 (출력만 할 거니까)
+
+
+# 결과를 읽는 법
+#   q=1.0 -> 나쁜 행동(Q=-1)에도 확률이 조금 남습니다. 이게 SAC 입니다.
+#   q=2.0 -> 나쁜 행동의 확률이 사실상 0이 됩니다. 좋은 것에만 집중합니다.
+#
+# 어느 쪽이 나은가요? 문제에 따라 다릅니다.
+#   함정이 많은 문제  -> q 를 키워 나쁜 곳을 아예 배제하는 게 낫습니다
+#   길이 여러 개인 문제 -> q=1 로 골고루 남겨 두는 게 낫습니다
+
+# ── 6교시에서 이어받음 — SAC 구현 ──
+import gymnasium as gym                        # 게임(환경) 만드는 도구
+import torch                                   # 파이토치
+import torch.nn as nn                          # 신경망 부품 상자
+import numpy as np                             # 숫자 계산 도구
+import copy                                    # 통째로 복사하는 도구
+
+env = gym.make("Pendulum-v1")                  # 막대 세우기 (연속 행동)
+state_dim, action_dim = 3, 1                   # 상황 3개, 행동 1개
+max_action = float(env.action_space.high[0])   # 힘의 최대 크기 = 2.0
+
+actor = GaussianActor(state_dim, action_dim, max_action)   # 4교시에서 만든 확률적 배우
+
+q1, q2 = Critic(state_dim, action_dim), Critic(state_dim, action_dim)
+# ★ 평론가를 두 명 둡니다 (트윈 Q) ★
+#   왜 두 명인가요?
+#     한 명이면 운 좋게 높게 매긴 점수를 그대로 믿게 됩니다 (2일차 최대화 편향).
+#     두 명에게 물어보고 '더 낮게 말한 쪽'을 택하면 부풀려지는 걸 막습니다.
+#     보수적으로 보는 것이 안전하다는 뜻입니다.
+
+q1_t, q2_t = copy.deepcopy(q1), copy.deepcopy(q2)   # 각각의 과녁(복사본)
+
+actor_opt = torch.optim.Adam(actor.parameters(), lr=3e-4)          # 배우용
+q_opt = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=3e-4)
+# 평론가 둘을 한 옵티마이저로 함께 학습시킵니다 (손실도 더해서 한 번에)
+
+# ── 온도 alpha 를 사람이 정하지 않고 스스로 조절하게 만든다 ──
+log_alpha = torch.zeros(1, requires_grad=True)   # alpha 의 로그값을 학습 대상으로
+                                                 # 로그로 두는 이유: alpha 는 양수여야 하므로
+alpha_opt = torch.optim.Adam([log_alpha], lr=3e-4)
+
+target_entropy = -action_dim                   # 목표 엔트로피 = -(행동 개수) = -1
+# 이 값이 뭔가요?
+#   "이 정도는 계속 헷갈려 하자" 는 기준선입니다.
+#   실제 엔트로피가 이보다 낮아지면(너무 확신하면) alpha 를 키워 탐험을 늘리고,
+#   높아지면(너무 헤매면) alpha 를 줄입니다. 자동 온도조절기입니다.
+
+buffer = ReplayBuffer(100_000, action_dtype=torch.float32)   # 연속 행동이므로 float32
+gamma, batch_size = 0.99, 256                  # 한 번에 256개씩 꺼내 배운다
+
+
+def train_step():
+    """한 번 배우는 함수. 평론가 -> 배우 -> 온도 순서입니다."""
+
+    s, a, r, s_next, done = buffer.sample(batch_size)
+
+    alpha = log_alpha.exp().detach()           # 로그를 되돌려 실제 alpha 값으로
+                                               # detach: 여기서는 alpha 를 상수로 쓴다
+
+    # ── ① 평론가 둘 배우기 ──
+    with torch.no_grad():                      # 정답 만들기 — 미분 금지 구역
+        a_next, logp_next = actor(s_next)      # 다음 상황에서 할 행동과 그 로그확률
+
+        q_next = torch.min(q1_t(s_next, a_next), q2_t(s_next, a_next))
+        # 두 과녁 평론가 중 더 낮게 본 쪽을 택한다 (보수적으로)
+
+        y = r + gamma * (1 - done) * (q_next - alpha * logp_next)
+        #                              ^^^^^^^^^^^^^^^^^^^^^^^^^ 이게 SAC 의 핵심
+        # 원래는 q_next 만 썼는데, 여기에 "얼마나 헷갈려 했는지"를 더해 줍니다.
+        #   logp 가 작다(=확률이 낮다=뜻밖의 행동을 했다) -> 빼는 값이 커짐 -> 보너스
+        # 즉 "골고루 해보는 것 자체에 점수를 준다"는 뜻입니다.
+
+    q_loss = nn.functional.mse_loss(q1(s, a), y) + nn.functional.mse_loss(q2(s, a), y)
+    # 두 평론가의 손실을 더해 한 번에 학습시킨다
+    q_opt.zero_grad(); q_loss.backward(); q_opt.step()
+
+    # ── ② 배우 배우기 ──
+    a_new, logp = actor(s)                     # 지금 정책으로 행동을 다시 뽑아 본다
+                                               # (일기장에 적힌 옛날 행동이 아니라 새로!)
+    q_new = torch.min(q1(s, a_new), q2(s, a_new))     # 두 평론가 중 낮은 쪽
+
+    actor_loss = (alpha * logp - q_new).mean()
+    # 배우의 목표 두 가지를 한 줄에 담았습니다.
+    #   -q_new  : 점수를 높이고 싶다
+    #   +alpha*logp : 너무 확신하지 말라 (logp 가 크면 = 확신하면 손실이 커짐)
+    actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
+
+    # ── ③ 온도 alpha 스스로 조절하기 ──
+    alpha_loss = -(log_alpha.exp() * (logp + target_entropy).detach()).mean()
+    # 읽는 법:
+    #   logp + target_entropy 가 양수 = 너무 확신하고 있다 -> alpha 를 키운다
+    #   음수 = 충분히 헤매고 있다 -> alpha 를 줄인다
+    # .detach() 로 배우 쪽에는 영향을 주지 않게 끊었습니다.
+    alpha_opt.zero_grad(); alpha_loss.backward(); alpha_opt.step()
+
+    # ── ④ 과녁을 조금씩 따라오게 ──
+    soft_update(q1_t, q1); soft_update(q2_t, q2)
+    # 배우에는 과녁이 없습니다. SAC 는 배우 과녁이 필요 없기 때문입니다.
+
+
+returns = []                                   # 판별 점수 (= 학습곡선)
+
+for episode in range(150):                     # 150판
+    s, _ = env.reset()
+    total, done = 0.0, False
+
+    while not done:
+        with torch.no_grad():                  # 행동만 고를 땐 미분 불필요
+            a, _ = actor(torch.as_tensor(s, dtype=torch.float32))
+            # 로그확률은 지금 필요 없으니 _ 로 버립니다.
+            # DDPG 와 달리 잡음을 따로 안 더합니다 — 정책 자체가 확률적이니까요.
+
+        s_next, r, term, trunc, _ = env.step(a.numpy())    # 실제로 해본다
+        done = term or trunc
+
+        buffer.push(s, a.numpy(), r, s_next, float(term))  # 일기장에 적기
+        s, total = s_next, total + r
+
+        if len(buffer) >= 1000:                # 1000줄 쌓인 뒤부터 배운다
+            train_step()
+
+    returns.append(total)
+
+    if episode % 10 == 0:
+        print(f"ep {episode:3d}  평균 {np.mean(returns[-10:]):7.1f}  alpha {log_alpha.exp().item():.3f}")
+        # alpha 가 어떻게 변하는지 함께 보세요.
+        # 보통 처음엔 커졌다가(많이 탐험) 나중엔 작아집니다(확신이 생김).
+
+# 학습에 9분쯤 걸립니다. -1200 에서 시작해 -200 근처까지 오르면 잘 된 것입니다.
+
+# ── 오늘 이 교시 — TAC 구현 ──
+import torch                                   # 파이토치
+
+# ============================================================
+# SAC 를 TAC 로 바꾸는 데 필요한 건 딱 두 곳입니다.
+# 엔트로피를 재는 자를 log 에서 q-log 로 바꾸기만 하면 됩니다.
+# 3일 동안 배운 것 중 가장 작은 변경으로 가장 다른 성질을 얻는 예입니다.
+# ============================================================
+
+ENTROPIC_INDEX = 2.0                           # q 값. 1.0 으로 두면 SAC 와 완전히 같아집니다.
+
+
+def q_log_prob(log_prob, q=ENTROPIC_INDEX):
+    """
+    log π 를 log_q π 로 바꾸는 함수.
+    log_prob 은 4교시 GaussianActor 가 돌려주는 그 값입니다.
+    """
+    if abs(q - 1.0) < 1e-6:                    # q 가 사실상 1이면
+        return log_prob                        # 그대로 돌려준다 (= SAC)
+
+    prob = log_prob.exp().clamp(min=1e-8)      # 로그를 되돌려 확률로
+                                               # clamp: 0이 되면 계산이 깨지므로 바닥을 깔아 준다
+
+    return (prob.pow(q - 1) - 1) / (q - 1)     # q-로그 공식
+
+
+# ============================================================
+# SAC 의 train_step 에서 딱 두 줄만 바꿉니다
+# ============================================================
+
+# ① 정답(soft TD 목표) 만드는 줄
+#    바꾸기 전:  y = r + gamma * (1 - done) * (q_next - alpha * logp_next)
+#    바꾼 뒤:    y = r + gamma * (1 - done) * (q_next - alpha * q_log_prob(logp_next))
+
+# ② 배우 손실 줄
+#    바꾸기 전:  actor_loss = (alpha * logp - q_new).mean()
+#    바꾼 뒤:    actor_loss = (alpha * q_log_prob(logp) - q_new).mean()
+
+# 나머지는 손도 대지 않습니다. 트윈 Q, 과녁, 온도 조절 전부 그대로입니다.
+
+
+# ============================================================
+# 직접 해볼 것
+# ============================================================
+#  1. ENTROPIC_INDEX = 1.0 으로 두고 돌려서 SAC 와 결과가 같은지 확인해 보세요.
+#     같아야 정상입니다. 다르면 어딘가 잘못 바꾼 것입니다. (좋은 검증 방법입니다)
+#  2. q = 1.5, 2.0 으로 학습곡선을 비교해 보세요.
+#  3. Pendulum 은 행동이 1개뿐이라 차이가 잘 안 보입니다.
+#     HalfCheetah 처럼 행동이 여러 개인 환경에서 q>1 의 효과가 뚜렷해집니다.
+
+
+# ============================================================
+# 3일 전체 정리 — 우리가 온 길
+# ============================================================
+# 1일차  문제를 적는 법(MDP)과 벨만 방정식
+#        -> 규칙을 다 알 때 계산으로 푸는 법 (DP)
+#        -> 규칙을 몰라도 해보면서 배우는 법 (MC / TD)
+#        -> 행동까지 배우기 (SARSA / Q-Learning)
+#
+# 2일차  표가 너무 커져서 신경망으로 바꾸기 (DQN, Double DQN)
+#        -> 값이 아니라 행동을 직접 배우기 (Policy Gradient)
+#        -> 둘을 합치기 (Actor-Critic, A2C)
+#
+# 3일차  행동이 연속값일 때 (DDPG)
+#        -> 골고루 해보는 것에 점수 주기 (SAC)
+#        -> 그 점수 매기는 자를 바꾸기 (TAC)
+#
+# 이름은 계속 바뀌었지만 하는 일은 하나였습니다.
+#   "평가하고 개선한다" — 3일 내내 이것뿐이었습니다.
+
+# ============================================================
+# 잘 만들어졌는지 확인 (이 부분이 있어야 실행했을 때 결과가 보입니다)
+# ============================================================
+print('q-로그가 log 와 어떻게 다른지 확인합니다.')
+print()
+
+probs = [0.5, 0.2, 0.05, 0.01]
+logp = torch.log(torch.tensor(probs))            # 확률 4개의 로그
+
+print('   확률     log (SAC)    q=1.5      q=2.0')
+print('  ' + '-' * 44)
+for i, p in enumerate(probs):
+    lp = logp[i:i + 1]
+    v1 = q_log_prob(lp, 1.0).item()
+    v15 = q_log_prob(lp, 1.5).item()
+    v2 = q_log_prob(lp, 2.0).item()
+    print(f'  {p:6.2f}  {v1:10.4f}  {v15:9.4f}  {v2:9.4f}')
+
+print()
+print('  -> 확률이 작아질수록(0.01) log 는 -4.6 까지 내려가지만')
+print('     q=2.0 은 -0.99 에서 멈춥니다.')
+print()
+print('     log 는 확률 0 에 가까워지면 마이너스 무한대로 갑니다.')
+print('     그래서 SAC 는 나쁜 행동의 확률을 완전히 0 으로 못 만듭니다.')
+print('     q 를 키우면 그 제약이 풀려서 진짜 0 으로 만들 수 있습니다.')
+print()
+print(f'  q=1.0 이면 log 와 같은가: {torch.allclose(q_log_prob(logp, 1.0), logp)}')
+print('  -> True 여야 정상입니다. TAC 를 SAC 로 되돌릴 수 있다는 뜻입니다.')
